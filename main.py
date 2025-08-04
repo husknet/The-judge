@@ -3,6 +3,7 @@ import replicate
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
+import re
 
 app = FastAPI()
 
@@ -29,37 +30,38 @@ class AICheckRequest(BaseModel):
 async def health():
     return {"status": "ok"}
 
-async def research_isp_with_llm(isp: str) -> str:
+def research_isp_with_llm(isp: str) -> str:
     """
     Ask Llama-3-70b to think step-by-step and then output one of:
     [microsoft], [partner], [cloud], [vpn], [proxy],
-    [datacenter], [bot], [residential], or [unknown]
+    [datacenter], [bot], [residential], or [unknown].
+    Returns the final tag (without brackets) or "".
     """
     if not isp or not REPLICATE_API_TOKEN:
         return ""
     prompt = f"""
-You are an internet investigator.  
-Think step by step about whether the organization named "{isp}" is:
-
-- a Microsoft company/subsidiary/service/brand  
-- a Microsoft partner  
-- a cloud, VPN, proxy, datacenter, or scanning/bot network  
+You are an internet investigator.
+Think step by step about whether "{isp}" is:
+- a Microsoft company/subsidiary/service
+- a Microsoft partner
+- a cloud/VPN/proxy/datacenter/bot network
 - or a real residential ISP.
 
-Show your chain-of-thought, then on the last line output exactly one tag in square brackets:  
+Show your reasoning, then on the last line output exactly one tag in square brackets:
 [microsoft], [partner], [cloud], [vpn], [proxy], [datacenter], [bot], [residential], or [unknown].
 """
-    # Use replicate.stream to get reasoning
-    reasoning = ""
-    async for chunk in replicate.stream(
-        "meta/meta-llama-3-70b-instruct",
-        input={"prompt": prompt, "max_tokens": 200, "temperature": 0.0},
-    ):
-        reasoning += chunk
-    # Extract the last tag in square brackets
-    import re
-    tags = re.findall(r"\[(microsoft|partner|cloud|vpn|proxy|datacenter|bot|residential|unknown)\]", reasoning.lower())
-    return tags[-1] if tags else ""
+    try:
+        raw = replicate.run(
+            "meta/meta-llama-3-70b-instruct",
+            input={"prompt": prompt, "max_tokens": 200, "temperature": 0.0}
+        )
+        # raw may be a list of strings or a single string
+        text = "".join(raw) if isinstance(raw, list) else str(raw)
+        # find last tag
+        tags = re.findall(r"\[(microsoft|partner|cloud|vpn|proxy|datacenter|bot|residential|unknown)\]", text.lower())
+        return tags[-1] if tags else ""
+    except Exception:
+        return ""
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
@@ -75,7 +77,7 @@ async def ai_decision(data: AICheckRequest):
 
     # 2. ISP must classify as "residential"
     if data.isp:
-        llm_raw = await research_isp_with_llm(data.isp)
+        llm_raw = research_isp_with_llm(data.isp)
         if llm_raw != "residential":
             return {
                 "verdict":"bot",
@@ -83,7 +85,7 @@ async def ai_decision(data: AICheckRequest):
                 "details": data.dict()
             }
 
-    # 3. Browser heuristics fallback
+    # 3. Browser & fingerprint heuristics fallback
     ua = (data.ua or "").lower()
     if (
         any(tok in ua for tok in ["bot","curl","python","wget","scrapy","headless"])
