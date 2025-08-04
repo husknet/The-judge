@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 HF_TOKEN    = os.getenv("HF_TOKEN", "")
-MODEL_NAME  = "meta/meta-llama-3-70b-instruct"   # <- switched to Llama-3-70B-Instruct
+MODEL_NAME  = "meta-llama/Llama-3.3-70B-Instruct"   # <- switched to Llama-3-70B-Instruct
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -129,3 +129,4 @@ async def ai_decision(data: AICheckRequest):
 
     # 5. Human
     return {"verdict": "human", "reason": "All checks passed", "details": details}
+
