@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 import re
 import logging
-from huggingface_hub import InferenceClient  # Using Hugging Face for cost efficiency
+from huggingface_hub import InferenceClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-HF_TOKEN = os.getenv("HF_TOKEN", "")  # Hugging Face token
-MODEL_NAME = "tiiuae/falcon-180B"  # Efficient model for classification
+HF_TOKEN = os.getenv("HF_TOKEN", "")  
+MODEL_NAME = "tiiuae/falcon-180B"   # <-- switched to Falcon-180B
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -37,29 +37,24 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Dynamically analyzes ISPs with enhanced focus on:
-    - Microsoft-owned networks
-    - Microsoft partners
-    - Security/email scanners
-    Returns (classification, full_reasoning)
+    Analyze the ISP with Falcon-180B.
+    Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
-        return "", "No ISP or API token provided"
-    
-    prompt = f"""
-    [INST] Analyze "{isp}" with these priorities:
-    1. Is it DIRECTLY owned by Microsoft (Azure, LinkedIn, GitHub, etc.)?
-    2. Is it a Microsoft strategic partner (hosting, cloud services)?
-    3. Is it an email security service (Fortinet, Proofpoint, Mimecast)?
-    4. Could it be a residential ISP?
+        return "", "No ISP or HF_TOKEN provided"
 
-    Answer format:
-    - Start with "Analysis:"
-    - Explain step-by-step
-    - Final line MUST be: [residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], or [unknown]
-    [/INST]
-    """
-    
+    prompt = f"""
+You are an internet investigator. Think step by step about whether "{isp}" is:
+1. A Microsoft company/subsidiary/service.
+2. A Microsoft partner.
+3. An email security service (Fortinet, Proofpoint…).
+4. A cloud/VPN/proxy/datacenter/bot network.
+5. Or a real residential ISP.
+
+At the end, output exactly one tag in brackets: 
+[residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], or [unknown].
+"""
+
     try:
         client = InferenceClient(token=HF_TOKEN)
         response = client.text_generation(
@@ -68,25 +63,22 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
             max_new_tokens=200,
             temperature=0.0
         )
-        
-        logger.info(f"AI Analysis for '{isp}':\n{response}")
-        
-        # Extract the most relevant classification
+        reasoning = response if isinstance(response, str) else response.generated_text
+        logger.info(f"AI Analysis for '{isp}':\n{reasoning}")
+
         tags = re.findall(
             r"\[(residential|microsoft|partner|security|cloud|vpn|proxy|unknown)\]",
-            response.lower()
+            reasoning.lower()
         )
         classification = tags[-1] if tags else "unknown"
-        
-        return classification, response
-        
+        return classification, reasoning
+
     except Exception as e:
-        error_msg = f"AI Analysis Error: {str(e)}"
+        error_msg = f"AI Analysis Error: {e}"
         logger.error(error_msg)
         return "", error_msg
 
 def is_bot_classification(classification: str) -> bool:
-    """Determines if a classification should be treated as a bot"""
     return classification in ["microsoft", "partner", "security", "cloud", "vpn", "proxy"]
 
 @app.post("/ai-decision")
@@ -94,7 +86,7 @@ async def ai_decision(data: AICheckRequest):
     details = data.dict()
     logger.info(f"Incoming request: {details}")
 
-    # 1. Cloudflare flags (unchanged)
+    # 1. Cloudflare flags
     if any([
         data.isBotUserAgent,
         data.isScraperISP,
@@ -104,10 +96,9 @@ async def ai_decision(data: AICheckRequest):
     ]):
         return {"verdict": "bot", "reason": "Cloudflare flags", "details": details}
 
-    # 2. Enhanced ISP analysis
+    # 2. ISP analysis
     if data.isp:
         classification, reasoning = research_isp_with_llm(data.isp)
-        
         if not classification:
             return {
                 "verdict": "uncertain",
@@ -115,7 +106,6 @@ async def ai_decision(data: AICheckRequest):
                 "details": details,
                 "ai_reasoning": reasoning
             }
-            
         if is_bot_classification(classification):
             return {
                 "verdict": "bot",
@@ -124,20 +114,16 @@ async def ai_decision(data: AICheckRequest):
                 "ai_reasoning": reasoning
             }
 
-    # 3. Browser heuristics (unchanged)
+    # 3. Browser heuristics
     ua = (data.ua or "").lower()
-    bot_indicators = ["bot", "curl", "python", "wget", "scrapy", "headless"]
-    
-    if (not data.jsEnabled or 
-        not data.supportsCookies or 
-        any(x in ua for x in bot_indicators)):
+    bot_inds = ["bot","curl","python","wget","scrapy","headless"]
+    if not data.jsEnabled or not data.supportsCookies or any(b in ua for b in bot_inds):
         return {"verdict": "bot", "reason": "Browser check failed", "details": details}
 
-    # 4. Suspicious characteristics
-    valid_languages = ["en-US", "en-CA", "en", "fr", "es", "de", "fr-CA"]
-    if len(data.ua) < 30 or data.screenRes == "0x0" or data.lang not in valid_languages:
+    # 4. Suspicious chars
+    valid_langs = ["en-US","en-CA","en","fr","es","de","fr-CA","ja-JP"]
+    if len(data.ua) < 30 or data.screenRes == "0x0" or data.lang not in valid_langs:
         return {"verdict": "uncertain", "reason": "Suspicious characteristics", "details": details}
 
     # 5. Human
     return {"verdict": "human", "reason": "All checks passed", "details": details}
-
