@@ -47,26 +47,38 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
     messages = [
         {
             "role": "system",
-            "content": (
-                "You are an ISP classification expert. Your job is to classify the given ISP string into exactly one of the following categories:\n"
-                "[residential] - A major consumer/residential/home or mobile ISP. Examples: Comcast, Rogers, MTN, Vodafone, SoftBank, etc.\n"
-                "[microsoft] - Microsoft or Microsoft subsidiaries (Azure, LinkedIn, GitHub, Outlook, etc).\n"
-                "[partner] - Microsoft strategic partners (Accenture, Infosys, etc).\n"
-                "[security] - Security/email companies and email relays (Fortinet, Proofpoint, Mimecast, Zscaler, Barracuda, etc).\n"
-                "[cloud] - Cloud/server/datacenter hosting providers (AWS, Google Cloud, OVH, Hetzner, DigitalOcean, Akamai, etc).\n"
-                "[vpn] - VPN or privacy proxy service (NordVPN, Mullvad, Tor, ExpressVPN, etc).\n"
-                "[proxy] - Public proxy, web unblocker, or relay service (Bright Data, Oxylabs, etc).\n"
-                "[scraper] - Known scanning or scraping network (Shodan, Censys, ZoomEye, BinaryEdge, etc).\n"
-                "[unknown] - Not in any category or cannot determine.\n\n"
-                "Always think step-by-step: first check if residential, then any bot/network category, then output your conclusion.\n"
-                "Respond ONLY in this format:\n"
-                "Analysis: <step-by-step reasoning>\n"
-                "Conclusion: [residential|microsoft|partner|security|cloud|vpn|proxy|scraper|unknown]"
-            ),
-        },
-        {"role": "user", "content": f"Classify this ISP: {isp}"}
-    ]
+            "content": """You are an advanced network classifier with these absolute rules:
 
+1. RESIDENTIAL (must classify as [residential] if):
+   - Primary business is consumer internet/mobile services
+   - Serves home users (even if also offers business services)
+   - Examples: Comcast, Rogers, MTN, Airtel, Vodafone, Verizon
+
+2. BOT NETWORKS (must classify accordingly):
+   - [microsoft]: Microsoft-owned (Azure, LinkedIn, GitHub, etc.)
+   - [security]: Security services (Fortinet, Proofpoint, Zscaler)
+   - [cloud]: Cloud providers (AWS, GCP, DigitalOcean)
+   - [vpn]: VPN services (NordVPN, ExpressVPN)
+   - [proxy]: Proxy services (Luminati, Smartproxy)
+   - [scraper]: Scraping networks (ScraperAPI, ScrapingBee)
+
+3. CLASSIFICATION PROCESS:
+   a) First determine if residential provider
+   b) Then check for specific bot network types
+   c) Default to [unknown] if uncertain
+
+Output must contain:
+Analysis: [your step-by-step reasoning]
+Conclusion: [exact_tag]"""
+        },
+        {
+            "role": "user",
+            "content": f"""Classify this ISP with strict adherence to the rules:
+ISP: {isp}
+
+Provide your analysis and final classification tag in the required format."""
+        }
+    ]
     try:
         client = InferenceClient(token=HF_TOKEN)
         response = client.chat_completion(
@@ -154,3 +166,4 @@ async def ai_decision(data: AICheckRequest):
 
     # 5. Verified human
     return {"verdict": "human", "reason": "All checks passed", "details": details}
+
