@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-HF_TOKEN    = os.getenv("HF_TOKEN", "")
-MODEL_NAME  = "google/flan-t5-xl"   # <- switched to Llama-3-70B-Instruct
+HF_TOKEN   = os.getenv("HF_TOKEN", "")
+MODEL_NAME = "google/flan-t5-xl"   # now using Flan-T5-XL for text-generation
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -37,7 +37,7 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Analyze the ISP with Llama-3-70B-Instruct via HF InferenceClient.
+    Analyze the ISP with Flan-T5-XL via HF InferenceClient.
     Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
@@ -57,15 +57,17 @@ At the end, output exactly one tag in brackets:
 
     try:
         client = InferenceClient(token=HF_TOKEN)
-        # text_generation works for this instruct model
         response = client.text_generation(
-            prompt,
+            prompt=prompt,
             model=MODEL_NAME,
             max_new_tokens=200,
             temperature=0.0
         )
-        # HF InferenceClient may return a dict with "generated_text"
-        reasoning = response.get("generated_text", response) if isinstance(response, dict) else str(response)
+        # HF InferenceClient returns a dict with "generated_text" for text_generation
+        reasoning = response.get("generated_text", "")  
+        if not reasoning:
+            # sometimes it's returned as a list
+            reasoning = "".join(response) if isinstance(response, list) else str(response)
         logger.info(f"AI Analysis for '{isp}':\n{reasoning}")
 
         tags = re.findall(
@@ -90,15 +92,12 @@ async def ai_decision(data: AICheckRequest):
 
     # 1. Cloudflare flags
     if any([
-        data.isBotUserAgent,
-        data.isScraperISP,
-        data.isIPAbuser,
-        data.isSuspiciousTraffic,
-        data.isDataCenterASN
+        data.isBotUserAgent, data.isScraperISP, data.isIPAbuser,
+        data.isSuspiciousTraffic, data.isDataCenterASN
     ]):
         return {"verdict": "bot", "reason": "Cloudflare flags", "details": details}
 
-    # 2. ISP analysis via Llama-3-70B
+    # 2. ISP analysis via Flan-T5-XL
     if data.isp:
         classification, reasoning = research_isp_with_llm(data.isp)
         if not classification:
@@ -129,4 +128,3 @@ async def ai_decision(data: AICheckRequest):
 
     # 5. Human
     return {"verdict": "human", "reason": "All checks passed", "details": details}
-
