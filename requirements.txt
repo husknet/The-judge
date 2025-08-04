@@ -1,6 +1,8 @@
-fastapi
-httpx
-uvicorn
-pydantic
-replicate
-
+fastapi==0.109.1
+httpx==0.27.0
+uvicorn==0.27.0
+pydantic==2.6.3
+huggingface-hub==0.22.2
+transformers==4.40.1
+python-dotenv==1.0.1
+torch==2.2.2  # Only needed if using local GPU inference
