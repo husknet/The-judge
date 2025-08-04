@@ -1,10 +1,10 @@
 import os
-import replicate
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import re
 import logging
+from huggingface_hub import InferenceClient  # Using Hugging Face for cost efficiency
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
-os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
+HF_TOKEN = os.getenv("HF_TOKEN", "")  # Hugging Face token
+MODEL_NAME = "deepseek-ai/DeepSeek-R1"  # Efficient model for classification
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -37,59 +37,64 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Ask Llama-3-70b to classify an ISP and return both the classification and full reasoning.
-    Returns (classification, full_reasoning) tuple.
+    Dynamically analyzes ISPs with enhanced focus on:
+    - Microsoft-owned networks
+    - Microsoft partners
+    - Security/email scanners
+    Returns (classification, full_reasoning)
     """
-    if not isp or not REPLICATE_API_TOKEN:
+    if not isp or not HF_TOKEN:
         return "", "No ISP or API token provided"
     
     prompt = f"""
-You are an internet investigator. Analyze this ISP and classify it.
-Think step by step about whether "{isp}" is:
-- a Microsoft company/subsidiary/service
-- a Microsoft partner
-- a cloud/VPN/proxy/datacenter/bot network
-- or a real residential ISP.
+    [INST] Analyze "{isp}" with these priorities:
+    1. Is it DIRECTLY owned by Microsoft (Azure, LinkedIn, GitHub, etc.)?
+    2. Is it a Microsoft strategic partner (hosting, cloud services)?
+    3. Is it an email security service (Fortinet, Proofpoint, Mimecast)?
+    4. Could it be a residential ISP?
 
-Show your reasoning, then on the last line output exactly one tag in square brackets:
-[microsoft], [partner], [cloud], [vpn], [proxy], [datacenter], [bot], [residential], or [unknown].
-"""
+    Answer format:
+    - Start with "Analysis:"
+    - Explain step-by-step
+    - Final line MUST be: [residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], or [unknown]
+    [/INST]
+    """
+    
     try:
-        output = replicate.run(
-            "meta/meta-llama-3-70b-instruct",
-            input={
-                "prompt": prompt,
-                "max_tokens": 200,
-                "temperature": 0.0,
-                "top_p": 1.0
-            }
+        client = InferenceClient(token=HF_TOKEN)
+        response = client.text_generation(
+            prompt,
+            model=MODEL_NAME,
+            max_new_tokens=200,
+            temperature=0.0
         )
         
-        # Process the output which may be a list of strings or a single string
-        full_reasoning = "".join(output) if isinstance(output, list) else str(output)
+        logger.info(f"AI Analysis for '{isp}':\n{response}")
         
-        # Log the full AI reasoning
-        logger.info(f"AI ISP Classification Reasoning for '{isp}':\n{full_reasoning}")
-        
-        # Find all matching tags and return the last one
+        # Extract the most relevant classification
         tags = re.findall(
-            r"\[(microsoft|partner|cloud|vpn|proxy|datacenter|bot|residential|unknown)\]",
-            full_reasoning.lower()
+            r"\[(residential|microsoft|partner|security|cloud|vpn|proxy|unknown)\]",
+            response.lower()
         )
         classification = tags[-1] if tags else "unknown"
         
-        return classification, full_reasoning
+        return classification, response
+        
     except Exception as e:
-        error_msg = f"Error researching ISP: {str(e)}"
+        error_msg = f"AI Analysis Error: {str(e)}"
         logger.error(error_msg)
         return "", error_msg
+
+def is_bot_classification(classification: str) -> bool:
+    """Determines if a classification should be treated as a bot"""
+    return classification in ["microsoft", "partner", "security", "cloud", "vpn", "proxy"]
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
     details = data.dict()
-    logger.info(f"Incoming request data: {details}")
-    
-    # 1. Cloudflare flags override (immediate bot detection)
+    logger.info(f"Incoming request: {details}")
+
+    # 1. Cloudflare flags (unchanged)
     if any([
         data.isBotUserAgent,
         data.isScraperISP,
@@ -97,72 +102,41 @@ async def ai_decision(data: AICheckRequest):
         data.isSuspiciousTraffic,
         data.isDataCenterASN
     ]):
-        logger.info("Bot detected via Cloudflare flags")
-        return {
-            "verdict": "bot",
-            "reason": "Cloudflare flags indicate bot",
-            "details": details
-        }
+        return {"verdict": "bot", "reason": "Cloudflare flags", "details": details}
 
-    # 2. ISP classification check
+    # 2. Enhanced ISP analysis
     if data.isp:
-        isp_classification, full_reasoning = research_isp_with_llm(data.isp)
+        classification, reasoning = research_isp_with_llm(data.isp)
         
-        if not isp_classification:  # If LLM failed
-            logger.warning(f"Failed to classify ISP: {data.isp}")
+        if not classification:
             return {
                 "verdict": "uncertain",
-                "reason": f"Could not classify ISP '{data.isp}'",
+                "reason": "ISP analysis failed",
                 "details": details,
-                "ai_reasoning": full_reasoning
+                "ai_reasoning": reasoning
             }
             
-        if isp_classification != "residential":
-            logger.info(f"Non-residential ISP detected: {data.isp} ({isp_classification})")
+        if is_bot_classification(classification):
             return {
                 "verdict": "bot",
-                "reason": f'ISP "{data.isp}" classified as "{isp_classification}", not residential',
+                "reason": f"ISP classified as {classification}",
                 "details": details,
-                "ai_reasoning": full_reasoning
+                "ai_reasoning": reasoning
             }
 
-    # 3. Browser & fingerprint heuristics
+    # 3. Browser heuristics (unchanged)
     ua = (data.ua or "").lower()
-    bot_indicators = [
-        "bot", "curl", "python", "wget", "scrapy", 
-        "headless", "phantom", "selenium", "spider"
-    ]
+    bot_indicators = ["bot", "curl", "python", "wget", "scrapy", "headless"]
     
-    if not data.jsEnabled or not data.supportsCookies:
-        logger.info("Bot detected: Missing JavaScript or cookie support")
-        return {
-            "verdict": "bot",
-            "reason": "Missing JavaScript or cookie support",
-            "details": details
-        }
-    
-    if any(indicator in ua for indicator in bot_indicators):
-        logger.info(f"Bot detected via user agent: {ua}")
-        return {
-            "verdict": "bot",
-            "reason": "Bot-like user agent detected",
-            "details": details
-        }
+    if (not data.jsEnabled or 
+        not data.supportsCookies or 
+        any(x in ua for x in bot_indicators)):
+        return {"verdict": "bot", "reason": "Browser check failed", "details": details}
 
-    # Screen and language checks
+    # 4. Suspicious characteristics
     valid_languages = ["en-US", "en-CA", "en", "fr", "es", "de", "fr-CA"]
     if len(data.ua) < 30 or data.screenRes == "0x0" or data.lang not in valid_languages:
-        logger.info(f"Uncertain detection - suspicious UA/screen/lang: {data.ua}, {data.screenRes}, {data.lang}")
-        return {
-            "verdict": "uncertain",
-            "reason": "Suspicious user agent, screen resolution, or language",
-            "details": details
-        }
+        return {"verdict": "uncertain", "reason": "Suspicious characteristics", "details": details}
 
-    # 4. All checks passed - human
-    logger.info("Request passed all checks as human")
-    return {
-        "verdict": "human",
-        "reason": "All heuristics passed",
-        "details": details
-    }
+    # 5. Human
+    return {"verdict": "human", "reason": "All checks passed", "details": details}
