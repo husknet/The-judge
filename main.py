@@ -105,7 +105,8 @@ Provide analysis showing how each rule applies, then your conclusion tag."""
             "residential", "consumer", "home users", 
             "internet service", "mobile provider"
         ]
-        if (any(kw in reasoning.lower() for kw in residential_keywords) and classification != "residential":
+        if (any(kw in reasoning.lower() for kw in residential_keywords) and 
+            classification != "residential"):
             logger.warning(f"Overriding classification to residential for {isp}")
             classification = "residential"
             reasoning += "\n[OVERRIDE: Corrected to residential based on analysis]"
