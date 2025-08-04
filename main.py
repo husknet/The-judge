@@ -7,10 +7,7 @@ import logging
 from huggingface_hub import InferenceClient
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -36,50 +33,38 @@ class AICheckRequest(BaseModel):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "model": MODEL_NAME}
+    return {"status": "ok"}
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Enhanced ISP classification with strict rules to minimize false positives.
-    Returns tuple of (classification, reasoning)
+    Analyze ISP with DeepSeek-R1-0528-Qwen3-8B via HF InferenceClient.
+    Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
-        logger.warning("Missing ISP or HF_TOKEN")
-        return "", "Missing required parameters"
+        return "", "No ISP or HF_TOKEN provided"
 
+    # ONLY the messages section is changed below
     messages = [
         {
             "role": "system",
-            "content": """You are an advanced network classifier with these absolute rules:
-
-1. RESIDENTIAL PROVIDERS (must classify as [residential]):
-   - Primary business is consumer internet/mobile services
-   - Even if they offer security products or business services
-   - Examples: MTN, Airtel, Rogers, Comcast, Verizon, Vodafone
-
-2. ABSOLUTE BOT NETWORKS (must classify accordingly):
-   - [microsoft]: Any Microsoft-owned service (Azure, LinkedIn, GitHub)
-   - [security]: Dedicated security services (Fortinet, Zscaler, Proofpoint)
-   - [cloud]: Cloud platforms (AWS, GCP, DigitalOcean)
-   - [vpn]: VPN/Proxy services (NordVPN, Tor, Private Internet Access)
-   - [scraper]: Known scraping/datacenter networks
-
-3. CLASSIFICATION PRIORITY:
-   a) First confirm if residential provider
-   b) Then check for absolute bot networks
-   c) Default to [unknown] if uncertain
-
-Output must contain:
-Analysis: [your step-by-step reasoning]
-Conclusion: [residential|microsoft|security|cloud|vpn|scraper|unknown]"""
+            "content": (
+                "You are an ISP classification expert. Your job is to classify the given ISP string into exactly one of the following categories:\n"
+                "[residential] - A major consumer/residential/home or mobile ISP. Examples: Comcast, Rogers, MTN, Vodafone, SoftBank, etc.\n"
+                "[microsoft] - Microsoft or Microsoft subsidiaries (Azure, LinkedIn, GitHub, Outlook, etc).\n"
+                "[partner] - Microsoft strategic partners (Accenture, Infosys, etc).\n"
+                "[security] - Security/email companies and email relays (Fortinet, Proofpoint, Mimecast, Zscaler, Barracuda, etc).\n"
+                "[cloud] - Cloud/server/datacenter hosting providers (AWS, Google Cloud, OVH, Hetzner, DigitalOcean, Akamai, etc).\n"
+                "[vpn] - VPN or privacy proxy service (NordVPN, Mullvad, Tor, ExpressVPN, etc).\n"
+                "[proxy] - Public proxy, web unblocker, or relay service (Bright Data, Oxylabs, etc).\n"
+                "[scraper] - Known scanning or scraping network (Shodan, Censys, ZoomEye, BinaryEdge, etc).\n"
+                "[unknown] - Not in any category or cannot determine.\n\n"
+                "Always think step-by-step: first check if residential, then any bot/network category, then output your conclusion.\n"
+                "Respond ONLY in this format:\n"
+                "Analysis: <step-by-step reasoning>\n"
+                "Conclusion: [residential|microsoft|partner|security|cloud|vpn|proxy|scraper|unknown]"
+            ),
         },
-        {
-            "role": "user",
-            "content": f"""Classify this ISP with strict adherence to the rules:
-ISP: {isp}
-
-Provide your analysis and final classification tag."""
-        }
+        {"role": "user", "content": f"Classify this ISP: {isp}"}
     ]
 
     try:
@@ -87,141 +72,85 @@ Provide your analysis and final classification tag."""
         response = client.chat_completion(
             messages=messages,
             model=MODEL_NAME,
-            max_tokens=300,
-            temperature=0.1,
-            stop_sequences=["\n"]
+            max_tokens=200,
+            temperature=0.0
         )
         
+        # Process response
         reasoning = response.choices[0].message.content
-        logger.info(f"ISP classification result for '{isp}':\n{reasoning}")
+        logger.info(f"DeepSeek Analysis for '{isp}':\n{reasoning}")
 
-        # Strict tag extraction with validation
-        conclusion_match = re.search(
-            r"Conclusion:\s*\[(residential|microsoft|security|cloud|vpn|scraper|unknown)\]",
-            reasoning,
-            re.IGNORECASE
+        # Extract classification tag
+        tags = re.findall(
+            r"\[(residential|microsoft|partner|security|cloud|vpn|proxy|scraper|unknown)\]",
+            reasoning.lower()
         )
-        
-        classification = conclusion_match.group(1).lower() if conclusion_match else "unknown"
-        
-        # Post-classification validation
-        if classification != "residential":
-            # Check for false positives (common ISP names misclassified)
-            isp_lower = isp.lower()
-            residential_indicators = {
-                "telecom", "communications", "mobile", "broadband",
-                "wireless", "fiber", "networks", "isp", "internet"
-            }
-            
-            if any(ind in isp_lower for ind in residential_indicators):
-                classification = "residential"
-                reasoning += "\n[OVERRIDE: Residential indicators detected]"
-
+        classification = tags[-1] if tags else "unknown"
         return classification, reasoning
 
     except Exception as e:
-        error_msg = f"Classification failed for {isp}: {str(e)}"
+        error_msg = f"DeepSeek Analysis Error: {str(e)}"
         logger.error(error_msg)
         return "", error_msg
 
 def is_bot_classification(classification: str) -> bool:
-    """Determine if classification should be blocked as non-human traffic"""
-    return classification in {
-        "microsoft", "security", "cloud",
-        "vpn", "scraper"  # Removed 'partner' and 'proxy' for clarity
-    }
+    """Check if classification indicates non-human traffic"""
+    return classification in {"microsoft", "partner", "security", "cloud", "vpn", "proxy"}
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
-    request_details = data.dict()
-    logger.info(f"New request: {request_details}")
+    details = data.dict()
+    logger.info(f"Request received: {details}")
 
-    # 1. Immediate Cloudflare bot flags
-    cloudflare_flags = {
-        "isBotUserAgent": data.isBotUserAgent,
-        "isScraperISP": data.isScraperISP,
-        "isIPAbuser": data.isIPAbuser,
-        "isSuspiciousTraffic": data.isSuspiciousTraffic,
-        "isDataCenterASN": data.isDataCenterASN
-    }
-    
-    if any(cloudflare_flags.values()):
-        logger.warning(f"Bot detected via Cloudflare flags: {cloudflare_flags}")
-        return {
-            "verdict": "bot",
-            "reason": "Cloudflare security flags triggered",
-            "details": request_details
-        }
+    # 1. Cloudflare flags
+    if any([
+        data.isBotUserAgent,
+        data.isScraperISP,
+        data.isIPAbuser,
+        data.isSuspiciousTraffic,
+        data.isDataCenterASN
+    ]):
+        return {"verdict": "bot", "reason": "Cloudflare security flags", "details": details}
 
-    # 2. Comprehensive ISP analysis
+    # 2. Enhanced ISP analysis
     if data.isp:
         classification, reasoning = research_isp_with_llm(data.isp)
         
         if not classification:
-            logger.error(f"Failed to classify ISP: {data.isp}")
             return {
                 "verdict": "uncertain",
-                "reason": "ISP classification service unavailable",
-                "details": request_details,
+                "reason": "ISP classification failed",
+                "details": details,
                 "ai_reasoning": reasoning
             }
             
         if is_bot_classification(classification):
-            logger.info(f"Bot network detected: {classification} for {data.isp}")
             return {
                 "verdict": "bot",
-                "reason": f"Classified as {classification} network",
-                "details": request_details,
+                "reason": f"Non-residential ISP: {classification}",
+                "details": details,
                 "ai_reasoning": reasoning
             }
 
-    # 3. Browser fingerprint checks
+    # 3. Browser fingerprinting
     ua = (data.ua or "").lower()
     bot_indicators = {
         "bot", "curl", "python", "wget", "scrapy",
         "headless", "phantom", "selenium", "spider",
-        "zgrab", "nmap", "masscan", "automated"
+        "zgrab", "nmap", "masscan"
     }
     
-    browser_checks = {
-        "no_js": not data.jsEnabled,
-        "no_cookies": not data.supportsCookies,
-        "bot_ua": any(ind in ua for ind in bot_indicators),
-        "short_ua": len(data.ua or "") < 20
-    }
-    
-    if any(browser_checks.values()):
-        logger.warning(f"Bot detected via browser checks: {browser_checks}")
-        return {
-            "verdict": "bot",
-            "reason": "Automation characteristics detected",
-            "details": request_details
-        }
+    if (not data.jsEnabled or 
+        not data.supportsCookies or 
+        any(ind in ua for ind in bot_indicators)):
+        return {"verdict": "bot", "reason": "Automation detected", "details": details}
 
     # 4. Suspicious attributes
-    valid_languages = {
-        "en-US", "en-CA", "en-GB", "en", 
-        "fr", "es", "de", "fr-CA", "ja-JP"
-    }
-    
-    suspicious_attributes = {
-        "invalid_resolution": data.screenRes in {"0x0", "1x1"},
-        "unusual_language": data.lang not in valid_languages,
-        "missing_timezone": not data.timezone
-    }
-    
-    if any(suspicious_attributes.values()):
-        logger.info(f"Suspicious attributes: {suspicious_attributes}")
-        return {
-            "verdict": "uncertain",
-            "reason": "Suspicious client characteristics",
-            "details": request_details
-        }
+    valid_languages = {"en-US", "en-CA", "en", "fr", "es", "de", "fr-CA", "ja-JP"}
+    if (len(data.ua) < 20 or 
+        data.screenRes in {"0x0", "1x1"} or 
+        data.lang not in valid_languages):
+        return {"verdict": "uncertain", "reason": "Suspicious client attributes", "details": details}
 
-    # 5. Verified human traffic
-    logger.info("Request passed all verification checks")
-    return {
-        "verdict": "human",
-        "reason": "All checks passed",
-        "details": request_details
-    }
+    # 5. Verified human
+    return {"verdict": "human", "reason": "All checks passed", "details": details}
