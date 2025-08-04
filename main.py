@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")  # Hugging Face token
-MODEL_NAME = "deepseek-ai/DeepSeek-R1"  # Efficient model for classification
+MODEL_NAME = "tiiuae/falcon-180B"  # Efficient model for classification
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -140,3 +140,4 @@ async def ai_decision(data: AICheckRequest):
 
     # 5. Human
     return {"verdict": "human", "reason": "All checks passed", "details": details}
+
