@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
-MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"  # Updated model
+MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -43,34 +43,29 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
     if not isp or not HF_TOKEN:
         return "", "No ISP or HF_TOKEN provided"
 
-    prompt = f"""
-<|im_start|>system
-You are an expert ISP classifier. Analyze "{isp}" step-by-step:
-1. Check for Microsoft ownership/partnership
-2. Identify security services (Fortinet, Proofpoint, etc.)
-3. Detect cloud/VPN/proxy networks
-4. Verify residential status
-<|im_end|>
-<|im_start|>user
-Provide classification with reasoning. Final tag must be exactly one of:
-[residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], [unknown]
-<|im_end|>
-<|im_start|>assistant
-Analysis:
-"""
+    messages = [
+        {"role": "system", "content": f"""
+        You are an expert ISP classifier. Analyze "{isp}" step-by-step:
+        1. Check for Microsoft ownership/partnership
+        2. Identify security services (Fortinet, Proofpoint, etc.)
+        3. Detect cloud/VPN/proxy networks
+        4. Verify residential status"""},
+        {"role": "user", "content": """
+        Provide classification with reasoning. Final tag must be exactly one of:
+        [residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], [unknown]"""}
+    ]
 
     try:
         client = InferenceClient(token=HF_TOKEN)
-        response = client.text_generation(
-            prompt=prompt,
+        response = client.chat_completion(
+            messages=messages,
             model=MODEL_NAME,
-            max_new_tokens=200,
-            temperature=0.0,
-            stop_sequences=["<|im_end|>"]  # Proper stopping for this model
+            max_tokens=200,
+            temperature=0.0
         )
         
-        # Process response (handles both string and dict outputs)
-        reasoning = response.get("generated_text", response) if isinstance(response, dict) else response
+        # Process response
+        reasoning = response.choices[0].message.content
         logger.info(f"DeepSeek Analysis for '{isp}':\n{reasoning}")
 
         # Extract classification tag
