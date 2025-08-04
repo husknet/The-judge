@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-HF_TOKEN = os.getenv("HF_TOKEN", "")  
-MODEL_NAME = "tiiuae/falcon-180B"   # <-- switched to Falcon-180B
+HF_TOKEN    = os.getenv("HF_TOKEN", "")
+MODEL_NAME  = "meta/meta-llama-3-70b-instruct"   # <- switched to Llama-3-70B-Instruct
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -37,7 +37,7 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Analyze the ISP with Falcon-180B.
+    Analyze the ISP with Llama-3-70B-Instruct via HF InferenceClient.
     Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
@@ -47,23 +47,25 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
 You are an internet investigator. Think step by step about whether "{isp}" is:
 1. A Microsoft company/subsidiary/service.
 2. A Microsoft partner.
-3. An email security service (Fortinet, Proofpoint…).
+3. An email security service (e.g. Fortinet, Proofpoint).
 4. A cloud/VPN/proxy/datacenter/bot network.
 5. Or a real residential ISP.
 
-At the end, output exactly one tag in brackets: 
+At the end, output exactly one tag in brackets:
 [residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], or [unknown].
 """
 
     try:
         client = InferenceClient(token=HF_TOKEN)
+        # text_generation works for this instruct model
         response = client.text_generation(
             prompt,
             model=MODEL_NAME,
             max_new_tokens=200,
             temperature=0.0
         )
-        reasoning = response if isinstance(response, str) else response.generated_text
+        # HF InferenceClient may return a dict with "generated_text"
+        reasoning = response.get("generated_text", response) if isinstance(response, dict) else str(response)
         logger.info(f"AI Analysis for '{isp}':\n{reasoning}")
 
         tags = re.findall(
@@ -96,7 +98,7 @@ async def ai_decision(data: AICheckRequest):
     ]):
         return {"verdict": "bot", "reason": "Cloudflare flags", "details": details}
 
-    # 2. ISP analysis
+    # 2. ISP analysis via Llama-3-70B
     if data.isp:
         classification, reasoning = research_isp_with_llm(data.isp)
         if not classification:
@@ -120,7 +122,7 @@ async def ai_decision(data: AICheckRequest):
     if not data.jsEnabled or not data.supportsCookies or any(b in ua for b in bot_inds):
         return {"verdict": "bot", "reason": "Browser check failed", "details": details}
 
-    # 4. Suspicious chars
+    # 4. Suspicious characteristics
     valid_langs = ["en-US","en-CA","en","fr","es","de","fr-CA","ja-JP"]
     if len(data.ua) < 30 or data.screenRes == "0x0" or data.lang not in valid_langs:
         return {"verdict": "uncertain", "reason": "Suspicious characteristics", "details": details}
