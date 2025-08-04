@@ -4,6 +4,11 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import re
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -30,17 +35,16 @@ class AICheckRequest(BaseModel):
 async def health():
     return {"status": "ok"}
 
-def research_isp_with_llm(isp: str) -> str:
+def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Ask Llama-3-70b to think step-by-step and then output one of:
-    [microsoft], [partner], [cloud], [vpn], [proxy],
-    [datacenter], [bot], [residential], or [unknown].
-    Returns the final tag (without brackets) or "".
+    Ask Llama-3-70b to classify an ISP and return both the classification and full reasoning.
+    Returns (classification, full_reasoning) tuple.
     """
     if not isp or not REPLICATE_API_TOKEN:
-        return ""
+        return "", "No ISP or API token provided"
+    
     prompt = f"""
-You are an internet investigator.
+You are an internet investigator. Analyze this ISP and classify it.
 Think step by step about whether "{isp}" is:
 - a Microsoft company/subsidiary/service
 - a Microsoft partner
@@ -51,21 +55,41 @@ Show your reasoning, then on the last line output exactly one tag in square brac
 [microsoft], [partner], [cloud], [vpn], [proxy], [datacenter], [bot], [residential], or [unknown].
 """
     try:
-        raw = replicate.run(
+        output = replicate.run(
             "meta/meta-llama-3-70b-instruct",
-            input={"prompt": prompt, "max_tokens": 200, "temperature": 0.0}
+            input={
+                "prompt": prompt,
+                "max_tokens": 200,
+                "temperature": 0.0,
+                "top_p": 1.0
+            }
         )
-        # raw may be a list of strings or a single string
-        text = "".join(raw) if isinstance(raw, list) else str(raw)
-        # find last tag
-        tags = re.findall(r"\[(microsoft|partner|cloud|vpn|proxy|datacenter|bot|residential|unknown)\]", text.lower())
-        return tags[-1] if tags else ""
-    except Exception:
-        return ""
+        
+        # Process the output which may be a list of strings or a single string
+        full_reasoning = "".join(output) if isinstance(output, list) else str(output)
+        
+        # Log the full AI reasoning
+        logger.info(f"AI ISP Classification Reasoning for '{isp}':\n{full_reasoning}")
+        
+        # Find all matching tags and return the last one
+        tags = re.findall(
+            r"\[(microsoft|partner|cloud|vpn|proxy|datacenter|bot|residential|unknown)\]",
+            full_reasoning.lower()
+        )
+        classification = tags[-1] if tags else "unknown"
+        
+        return classification, full_reasoning
+    except Exception as e:
+        error_msg = f"Error researching ISP: {str(e)}"
+        logger.error(error_msg)
+        return "", error_msg
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
-    # 1. Cloudflare flags override
+    details = data.dict()
+    logger.info(f"Incoming request data: {details}")
+    
+    # 1. Cloudflare flags override (immediate bot detection)
     if any([
         data.isBotUserAgent,
         data.isScraperISP,
@@ -73,33 +97,72 @@ async def ai_decision(data: AICheckRequest):
         data.isSuspiciousTraffic,
         data.isDataCenterASN
     ]):
-        return {"verdict":"bot","reason":"Cloudflare flags indicate bot","details":data.dict()}
+        logger.info("Bot detected via Cloudflare flags")
+        return {
+            "verdict": "bot",
+            "reason": "Cloudflare flags indicate bot",
+            "details": details
+        }
 
-    # 2. ISP must classify as "residential"
+    # 2. ISP classification check
     if data.isp:
-        llm_raw = research_isp_with_llm(data.isp)
-        if llm_raw != "residential":
+        isp_classification, full_reasoning = research_isp_with_llm(data.isp)
+        
+        if not isp_classification:  # If LLM failed
+            logger.warning(f"Failed to classify ISP: {data.isp}")
             return {
-                "verdict":"bot",
-                "reason":f'ISP "{data.isp}" classified as "{llm_raw or "no tag"}", not residential',
-                "details": data.dict()
+                "verdict": "uncertain",
+                "reason": f"Could not classify ISP '{data.isp}'",
+                "details": details,
+                "ai_reasoning": full_reasoning
+            }
+            
+        if isp_classification != "residential":
+            logger.info(f"Non-residential ISP detected: {data.isp} ({isp_classification})")
+            return {
+                "verdict": "bot",
+                "reason": f'ISP "{data.isp}" classified as "{isp_classification}", not residential',
+                "details": details,
+                "ai_reasoning": full_reasoning
             }
 
-    # 3. Browser & fingerprint heuristics fallback
+    # 3. Browser & fingerprint heuristics
     ua = (data.ua or "").lower()
-    if (
-        any(tok in ua for tok in ["bot","curl","python","wget","scrapy","headless"])
-        or not data.jsEnabled
-        or not data.supportsCookies
-    ):
-        return {"verdict":"bot","reason":"Bad UA or missing JS/cookie","details":data.dict()}
+    bot_indicators = [
+        "bot", "curl", "python", "wget", "scrapy", 
+        "headless", "phantom", "selenium", "spider"
+    ]
+    
+    if not data.jsEnabled or not data.supportsCookies:
+        logger.info("Bot detected: Missing JavaScript or cookie support")
+        return {
+            "verdict": "bot",
+            "reason": "Missing JavaScript or cookie support",
+            "details": details
+        }
+    
+    if any(indicator in ua for indicator in bot_indicators):
+        logger.info(f"Bot detected via user agent: {ua}")
+        return {
+            "verdict": "bot",
+            "reason": "Bot-like user agent detected",
+            "details": details
+        }
 
-    if (
-        len(data.ua) < 30
-        or data.screenRes == "0x0"
-        or data.lang not in ["en-US","en","fr","es","de"]
-    ):
-        return {"verdict":"uncertain","reason":"Short UA or odd language/screen","details":data.dict()}
+    # Screen and language checks
+    valid_languages = ["en-US", "en-CA", "en", "fr", "es", "de", "fr-CA"]
+    if len(data.ua) < 30 or data.screenRes == "0x0" or data.lang not in valid_languages:
+        logger.info(f"Uncertain detection - suspicious UA/screen/lang: {data.ua}, {data.screenRes}, {data.lang}")
+        return {
+            "verdict": "uncertain",
+            "reason": "Suspicious user agent, screen resolution, or language",
+            "details": details
+        }
 
-    # 4. All checks passed
-    return {"verdict":"human","reason":"All heuristics passed","details":data.dict()}
+    # 4. All checks passed - human
+    logger.info("Request passed all checks as human")
+    return {
+        "verdict": "human",
+        "reason": "All heuristics passed",
+        "details": details
+    }
