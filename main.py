@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-HF_TOKEN   = os.getenv("HF_TOKEN", "")
-MODEL_NAME = "google/flan-t5-xl"   # now using Flan-T5-XL for text-generation
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+MODEL_NAME = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"  # Updated model
 
 class AICheckRequest(BaseModel):
     ua: Optional[str] = ""
@@ -37,22 +37,26 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Analyze the ISP with Flan-T5-XL via HF InferenceClient.
+    Analyze ISP with DeepSeek-R1-0528-Qwen3-8B via HF InferenceClient.
     Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
         return "", "No ISP or HF_TOKEN provided"
 
     prompt = f"""
-You are an internet investigator. Think step by step about whether "{isp}" is:
-1. A Microsoft company/subsidiary/service.
-2. A Microsoft partner.
-3. An email security service (e.g. Fortinet, Proofpoint).
-4. A cloud/VPN/proxy/datacenter/bot network.
-5. Or a real residential ISP.
-
-At the end, output exactly one tag in brackets:
-[residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], or [unknown].
+<|im_start|>system
+You are an expert ISP classifier. Analyze "{isp}" step-by-step:
+1. Check for Microsoft ownership/partnership
+2. Identify security services (Fortinet, Proofpoint, etc.)
+3. Detect cloud/VPN/proxy networks
+4. Verify residential status
+<|im_end|>
+<|im_start|>user
+Provide classification with reasoning. Final tag must be exactly one of:
+[residential], [microsoft], [partner], [security], [cloud], [vpn], [proxy], [unknown]
+<|im_end|>
+<|im_start|>assistant
+Analysis:
 """
 
     try:
@@ -61,15 +65,15 @@ At the end, output exactly one tag in brackets:
             prompt=prompt,
             model=MODEL_NAME,
             max_new_tokens=200,
-            temperature=0.0
+            temperature=0.0,
+            stop_sequences=["<|im_end|>"]  # Proper stopping for this model
         )
-        # HF InferenceClient returns a dict with "generated_text" for text_generation
-        reasoning = response.get("generated_text", "")  
-        if not reasoning:
-            # sometimes it's returned as a list
-            reasoning = "".join(response) if isinstance(response, list) else str(response)
-        logger.info(f"AI Analysis for '{isp}':\n{reasoning}")
+        
+        # Process response (handles both string and dict outputs)
+        reasoning = response.get("generated_text", response) if isinstance(response, dict) else response
+        logger.info(f"DeepSeek Analysis for '{isp}':\n{reasoning}")
 
+        # Extract classification tag
         tags = re.findall(
             r"\[(residential|microsoft|partner|security|cloud|vpn|proxy|unknown)\]",
             reasoning.lower()
@@ -78,53 +82,68 @@ At the end, output exactly one tag in brackets:
         return classification, reasoning
 
     except Exception as e:
-        error_msg = f"AI Analysis Error: {e}"
+        error_msg = f"DeepSeek Analysis Error: {str(e)}"
         logger.error(error_msg)
         return "", error_msg
 
 def is_bot_classification(classification: str) -> bool:
-    return classification in ["microsoft", "partner", "security", "cloud", "vpn", "proxy"]
+    """Check if classification indicates non-human traffic"""
+    return classification in {"microsoft", "partner", "security", "cloud", "vpn", "proxy"}
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
     details = data.dict()
-    logger.info(f"Incoming request: {details}")
+    logger.info(f"Request received: {details}")
 
     # 1. Cloudflare flags
     if any([
-        data.isBotUserAgent, data.isScraperISP, data.isIPAbuser,
-        data.isSuspiciousTraffic, data.isDataCenterASN
+        data.isBotUserAgent,
+        data.isScraperISP,
+        data.isIPAbuser,
+        data.isSuspiciousTraffic,
+        data.isDataCenterASN
     ]):
-        return {"verdict": "bot", "reason": "Cloudflare flags", "details": details}
+        return {"verdict": "bot", "reason": "Cloudflare security flags", "details": details}
 
-    # 2. ISP analysis via Flan-T5-XL
+    # 2. Enhanced ISP analysis
     if data.isp:
         classification, reasoning = research_isp_with_llm(data.isp)
+        
         if not classification:
             return {
                 "verdict": "uncertain",
-                "reason": "ISP analysis failed",
+                "reason": "ISP classification failed",
                 "details": details,
                 "ai_reasoning": reasoning
             }
+            
         if is_bot_classification(classification):
             return {
                 "verdict": "bot",
-                "reason": f"ISP classified as {classification}",
+                "reason": f"Non-residential ISP: {classification}",
                 "details": details,
                 "ai_reasoning": reasoning
             }
 
-    # 3. Browser heuristics
+    # 3. Browser fingerprinting
     ua = (data.ua or "").lower()
-    bot_inds = ["bot","curl","python","wget","scrapy","headless"]
-    if not data.jsEnabled or not data.supportsCookies or any(b in ua for b in bot_inds):
-        return {"verdict": "bot", "reason": "Browser check failed", "details": details}
+    bot_indicators = {
+        "bot", "curl", "python", "wget", "scrapy",
+        "headless", "phantom", "selenium", "spider",
+        "zgrab", "nmap", "masscan"
+    }
+    
+    if (not data.jsEnabled or 
+        not data.supportsCookies or 
+        any(ind in ua for ind in bot_indicators)):
+        return {"verdict": "bot", "reason": "Automation detected", "details": details}
 
-    # 4. Suspicious characteristics
-    valid_langs = ["en-US","en-CA","en","fr","es","de","fr-CA","ja-JP"]
-    if len(data.ua) < 30 or data.screenRes == "0x0" or data.lang not in valid_langs:
-        return {"verdict": "uncertain", "reason": "Suspicious characteristics", "details": details}
+    # 4. Suspicious attributes
+    valid_languages = {"en-US", "en-CA", "en", "fr", "es", "de", "fr-CA", "ja-JP"}
+    if (len(data.ua) < 20 or 
+        data.screenRes in {"0x0", "1x1"} or 
+        data.lang not in valid_languages):
+        return {"verdict": "uncertain", "reason": "Suspicious client attributes", "details": details}
 
-    # 5. Human
+    # 5. Verified human
     return {"verdict": "human", "reason": "All checks passed", "details": details}
