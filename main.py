@@ -44,7 +44,7 @@ Answer:"""
     url = "https://api.replicate.com/v1/completions"
     headers = {"Authorization": f"Token {REPLICATE_TOKEN}", "Content-Type": "application/json"}
     payload = {
-        "model": "meta/meta-llama-3-8b-instruct",
+        "model": "meta/meta-llama-3-70b-instruct",
         "prompt": prompt,
         "max_tokens": 12,
         "temperature": 0.0,
@@ -128,3 +128,4 @@ async def ai_decision(data: AICheckRequest):
             "reason": "All heuristics passed",
             "details": data.dict()
         }
+
