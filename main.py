@@ -9,11 +9,9 @@ from huggingface_hub import InferenceClient
 # Configure logging with increased max message length
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message).1000s'
 )
 logger = logging.getLogger(__name__)
-# Increase max log message length (adjust as needed)
-logger.handlers[0].setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message).1000s'))
 
 app = FastAPI()
 
