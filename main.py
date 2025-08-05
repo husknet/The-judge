@@ -44,7 +44,7 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
     Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
-        return "safe", "No ISP provided - default safe"
+        return "safe", "No ISP provided - default safe [safe]"
 
     messages = [
         {
@@ -63,15 +63,15 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
 3. VERIFICATION REQUIRED ([verification] tag):
    - Only if clearly suspicious but unclassified
 
-ANALYSIS REQUIREMENTS:
-1. Compare ISP against known lists
-2. Provide 1-line conclusion with tag
-3. Format: "[tag] ISP matches [category]"
+FORMAT REQUIREMENTS:
+1. Provide 50-word max reasoning
+2. End with exactly: [decision_tag]
+Example: "This residential ISP matches known safe networks [safe]"
 """
         },
         {
             "role": "user",
-            "content": f"Classify this ISP in one line: {isp}"
+            "content": f"Classify this ISP concisely: {isp}"
         }
     ]
 
@@ -80,65 +80,80 @@ ANALYSIS REQUIREMENTS:
         response = client.chat_completion(
             messages=messages,
             model=MODEL_NAME,
-            max_tokens=100,
+            max_tokens=150,
             temperature=0.1
         )
         
         reasoning = response.choices[0].message.content
         logger.info(f"ISP classification response: {reasoning}")
 
-        # Extract classification
-        if "[safe]" in reasoning.lower():
-            return "safe", reasoning.split('\n')[0]
-        elif "[unsafe]" in reasoning.lower():
-            return "unsafe", reasoning.split('\n')[0]
-        return "safe", reasoning.split('\n')[0]
+        # Extract decision tag and clean reasoning
+        tags = re.findall(r"\[(safe|unsafe|verification)\]", reasoning.lower())
+        classification = tags[-1] if tags else "safe"
+        clean_reason = re.sub(r"\[.*?\]", "", reasoning).strip()
+        
+        return classification, clean_reason
 
     except Exception as e:
         logger.error(f"ISP classification failed: {str(e)}")
-        return "safe", "Default safe classification"
+        return "safe", "Default safe classification [safe]"
 
-def get_verdict_reason(verdict: str, details: dict) -> str:
-    """Generate concise two-line reason for verdict"""
-    reasons = {
-        "bot": [
-            "Automation detected",
-            "Cloud provider/scraper network" if details.get('isDataCenterASN') else 
-            "Bot user agent" if details.get('isBotUserAgent') else
-            "Multiple abuse flags triggered"
-        ],
-        "captcha": [
-            "Suspicious browser characteristics",
-            "JS disabled" if not details.get('jsEnabled') else
-            "No cookies" if not details.get('supportsCookies') else
-            "Unusual screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
-            "Verification required"
-        ],
-        "user": [
-            "All checks passed",
-            "Residential network" if "comcast" in (details.get('isp') or "").lower() else
-            "Verified authentic user"
-        ]
+def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
+    """Generate complete decision response with structured reasoning"""
+    base_reasons = {
+        "bot": {
+            "title": "Automation detected",
+            "details": "Cloud provider network" if details.get('isDataCenterASN') else 
+                     "Bot user agent" if details.get('isBotUserAgent') else
+                     "Multiple abuse flags triggered"
+        },
+        "captcha": {
+            "title": "Verification required",
+            "details": "JS/Cookies disabled" if not details.get('jsEnabled') or not details.get('supportsCookies') else
+                      "Suspicious screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
+                      "Unusual browser characteristics"
+        },
+        "user": {
+            "title": "Authentic user",
+            "details": "Residential network" if "comcast" in (details.get('isp') or "").lower() else
+                      "All security checks passed"
+        }
     }
-    return '\n'.join(reasons.get(verdict, ["Unknown status", "Needs review"]))
+    
+    reason = base_reasons.get(verdict, {
+        "title": "Unknown status",
+        "details": "Needs manual review"
+    })
+    
+    if isp_reason:
+        reason['details'] = isp_reason
+    
+    return {
+        "verdict": verdict,
+        "reason": {
+            "summary": reason['title'],
+            "details": reason['details'],
+            "decision_tag": f"[{verdict}]"  # Added structured decision tag
+        },
+        "details": details
+    }
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
     details = data.dict()
     logger.info(f"Request received: {details}")
 
-    # 1. Immediate red flags
+    # 1. Check explicit abuse flags (highest priority)
     if any([data.isBotUserAgent, data.isScraperISP, 
            data.isIPAbuser, data.isSuspiciousTraffic,
            data.isDataCenterASN]):
-        return {
-            "verdict": "bot",
-            "reason": get_verdict_reason("bot", details),
-            "details": details
-        }
+        return format_decision("bot", details)
     
-    # 2. ISP analysis
-    isp_classification, reasoning = research_isp_with_llm(data.isp)
+    # 2. Analyze ISP through AI classification
+    isp_classification, isp_reason = research_isp_with_llm(data.isp)
+    
+    if isp_classification == "unsafe":
+        return format_decision("bot", details, isp_reason)
     
     # 3. Browser integrity checks
     ua = (data.ua or "").lower()
@@ -155,23 +170,8 @@ async def ai_decision(data: AICheckRequest):
         data.screenRes in {"0x0", "1x1"}
     )
     
-    # 4. Final decision
-    if isp_classification == "unsafe":
-        return {
-            "verdict": "bot", 
-            "reason": f"Unsafe network detected\n{reasoning}",
-            "details": details
-        }
-    elif suspicious_browser:
-        return {
-            "verdict": "captcha",
-            "reason": get_verdict_reason("captcha", details),
-            "details": details
-        }
+    if suspicious_browser:
+        return format_decision("captcha", details)
     
-    # 5. Verified safe user
-    return {
-        "verdict": "user",
-        "reason": get_verdict_reason("user", details),
-        "details": details
-    }
+    # 4. Verified safe user
+    return format_decision("user", details)
