@@ -65,12 +65,13 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
 
 ANALYSIS REQUIREMENTS:
 1. Compare ISP against known lists
-2. Explicitly state which rule applies
-3. Final line must contain: [safe|unsafe|verification]"""
+2. Provide 1-line conclusion with tag
+3. Format: "[tag] ISP matches [category]"
+"""
         },
         {
             "role": "user",
-            "content": f"Classify this ISP (respond concisely): {isp}"
+            "content": f"Classify this ISP in one line: {isp}"
         }
     ]
 
@@ -79,23 +80,47 @@ ANALYSIS REQUIREMENTS:
         response = client.chat_completion(
             messages=messages,
             model=MODEL_NAME,
-            max_tokens=150,  # Reduced to prevent cutoff
+            max_tokens=100,
             temperature=0.1
         )
         
         reasoning = response.choices[0].message.content
         logger.info(f"ISP classification response: {reasoning}")
 
-        # Robust tag extraction
+        # Extract classification
         if "[safe]" in reasoning.lower():
-            return "safe", reasoning
+            return "safe", reasoning.split('\n')[0]
         elif "[unsafe]" in reasoning.lower():
-            return "unsafe", reasoning
-        return "safe", reasoning  # Default to safe instead of verification
+            return "unsafe", reasoning.split('\n')[0]
+        return "safe", reasoning.split('\n')[0]
 
     except Exception as e:
         logger.error(f"ISP classification failed: {str(e)}")
         return "safe", "Default safe classification"
+
+def get_verdict_reason(verdict: str, details: dict) -> str:
+    """Generate concise two-line reason for verdict"""
+    reasons = {
+        "bot": [
+            "Automation detected",
+            "Cloud provider/scraper network" if details.get('isDataCenterASN') else 
+            "Bot user agent" if details.get('isBotUserAgent') else
+            "Multiple abuse flags triggered"
+        ],
+        "captcha": [
+            "Suspicious browser characteristics",
+            "JS disabled" if not details.get('jsEnabled') else
+            "No cookies" if not details.get('supportsCookies') else
+            "Unusual screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
+            "Verification required"
+        ],
+        "user": [
+            "All checks passed",
+            "Residential network" if "comcast" in (details.get('isp') or "").lower() else
+            "Verified authentic user"
+        ]
+    }
+    return '\n'.join(reasons.get(verdict, ["Unknown status", "Needs review"]))
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
@@ -108,11 +133,11 @@ async def ai_decision(data: AICheckRequest):
            data.isDataCenterASN]):
         return {
             "verdict": "bot",
-            "reason": "Automation flags detected",
+            "reason": get_verdict_reason("bot", details),
             "details": details
         }
     
-    # 2. ISP analysis (now with safe default)
+    # 2. ISP analysis
     isp_classification, reasoning = research_isp_with_llm(data.isp)
     
     # 3. Browser integrity checks
@@ -134,20 +159,19 @@ async def ai_decision(data: AICheckRequest):
     if isp_classification == "unsafe":
         return {
             "verdict": "bot", 
-            "reason": "Unsafe network",
-            "details": details,
-            "ai_reasoning": reasoning
+            "reason": f"Unsafe network detected\n{reasoning}",
+            "details": details
         }
     elif suspicious_browser:
         return {
             "verdict": "captcha",
-            "reason": "Browser verification needed",
+            "reason": get_verdict_reason("captcha", details),
             "details": details
         }
     
     # 5. Verified safe user
     return {
         "verdict": "user",
-        "reason": "Authentic user",
+        "reason": get_verdict_reason("user", details),
         "details": details
     }
