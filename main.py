@@ -40,96 +40,63 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Classify ISP into [safe], [unsafe], or [verification] categories.
-    Returns (classification, full_reasoning).
-    If tag is [unknown], treat as [unsafe].
+    Returns: (classification, full_response)
+    If response is missing/malformed, always defaults to 'unsafe'.
     """
     if not isp or not HF_TOKEN:
-        return "safe", "No ISP provided - default safe [safe]"
+        return "unsafe", "No ISP or HF_TOKEN provided"
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a professional network risk classifier.\n"
-                "Rules:\n"
-                "- [safe]: Major residential ISPs and regular mobile providers.\n"
-                "- [unsafe]: Anything cloud, security, scraping, VPN/proxy, Microsoft, or known bot infra.\n"
-                "- [unknown]: Use if ISP is not found in public records or you are unsure or rather isp is unknown.\n"
-                "- [verification]: Only use if the isp is a Major residential ISP but the provided flags still suggest it might be inaccurate.\n\n"
-                "Give a 1-2 sentence reasoning. END with one tag: [safe], [unsafe], [unknown], or [verification]."
-            )
-        },
-        {
-            "role": "user",
-            "content": f"Classify this ISP and explain why: {isp}"
-        }
-    ]
+    # Stricter prompt: single line, must end with one of the tags, very short.
+    prompt = (
+        "You are a strict ISP risk classifier.\n"
+        "Rules:\n"
+        "- [safe]: ONLY for well-known RESIDENTIAL ISPs and mobile carriers. Examples: Comcast, Rogers, Verizon, MTN, Airtel.\n"
+        "- [unsafe]: MUST USE for ANYTHING cloud, Microsoft,microsoft related services eg azure. any known proxy, VPN, scraper, business, datacenter, security, unknown, or if not 100% residential.\n"
+        "- [verification]: Use ONLY if major residential, but browser/device flags suggest bot.\n"
+        "Respond with a single short line: One phrase and EXACT tag at end. No extra text. Format:\n"
+        "'REASON [safe|unsafe|verification]'\n"
+        "Examples:\n"
+        "Cloud provider, not residential [unsafe]\n"
+        "ISP is Comcast [safe]\n"
+        "ISP is unknown [unsafe]\n"
+        "Residential, but browser suspicious [verification]\n"
+    )
 
     try:
         client = InferenceClient(token=HF_TOKEN)
         response = client.chat_completion(
-            messages=messages,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": f"Classify this ISP: {isp}"}
+            ],
             model=MODEL_NAME,
-            max_tokens=150,
-            temperature=0.1
+            max_tokens=20,   # Force brevity
+            temperature=0.01,
+            stop_sequences=["\n"]  # Enforce single line (if supported)
         )
-        
-        reasoning = response.choices[0].message.content
-        logger.info(f"ISP classification response: {reasoning}")
 
-        # Extract decision tag and clean reasoning
-        tags = re.findall(r"\[(safe|unsafe|unknown|verification)\]", reasoning.lower())
-        classification = tags[-1] if tags else "safe"
-        clean_reason = re.sub(r"\[.*?\]", "", reasoning).strip()
-        
-        # If the tag is [unknown], treat as [unsafe]
-        if classification == "unknown":
-            classification = "unsafe"
-            clean_reason = f"{clean_reason} [tag changed from unknown to unsafe]"
+        response_text = response.choices[0].message.content.strip()
+        # Extract exact tag: must match end of line, surrounded by brackets
+        match = re.match(r"^(.*)\[(safe|unsafe|verification)\]$", response_text)
+        if match:
+            tag = match.group(2)
+            reason = match.group(1).strip()
+        else:
+            tag = "unsafe"
+            reason = f"Malformed response: {response_text} [defaulted to unsafe]"
 
-        return classification, clean_reason
+        return tag, reason
 
     except Exception as e:
-        logger.error(f"ISP classification failed: {str(e)}")
-        return "safe", "Default safe classification [safe]"
+        return "unsafe", f"Classification Error: {str(e)}"
 
 def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
-    """Generate complete decision response with structured reasoning"""
-    base_reasons = {
-        "bot": {
-            "title": "Automation detected",
-            "details": "Cloud provider network" if details.get('isDataCenterASN') else 
-                     "Bot user agent" if details.get('isBotUserAgent') else
-                     "Multiple abuse flags triggered"
-        },
-        "captcha": {
-            "title": "Verification required",
-            "details": "JS/Cookies disabled" if not details.get('jsEnabled') or not details.get('supportsCookies') else
-                      "Suspicious screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
-                      "Unusual browser characteristics"
-        },
-        "user": {
-            "title": "Authentic user",
-            "details": "Residential network" if "comcast" in (details.get('isp') or "").lower() else
-                      "All security checks passed"
-        }
-    }
-    
-    reason = base_reasons.get(verdict, {
-        "title": "Unknown status",
-        "details": "Needs manual review"
-    })
-    
-    if isp_reason:
-        reason['details'] = isp_reason
-    
+    """Generate decision with only debug reason if needed."""
     return {
-        "verdict": verdict,
+        "verdict": verdict if verdict in {"bot", "captcha", "user"} else "bot",
         "reason": {
-            "summary": reason['title'],
-            "details": reason['details'],
-            "decision_tag": f"[{verdict}]"  # Added structured decision tag
+            "decision_tag": f"[{verdict}]",
+            "details": isp_reason
         },
         "details": details
     }
@@ -139,25 +106,25 @@ async def ai_decision(data: AICheckRequest):
     details = data.dict()
     logger.info(f"Request received: {details}")
 
-    # 1. Check explicit abuse flags (highest priority)
+    # 1. Explicit abuse flags
     if any([data.isBotUserAgent, data.isScraperISP, 
-           data.isIPAbuser, data.isSuspiciousTraffic,
-           data.isDataCenterASN]):
+            data.isIPAbuser, data.isSuspiciousTraffic,
+            data.isDataCenterASN]):
         return format_decision("bot", details)
     
-    # 2. Analyze ISP through AI classification
+    # 2. ISP AI classification
     isp_classification, isp_reason = research_isp_with_llm(data.isp)
-    
     if isp_classification == "unsafe":
         return format_decision("bot", details, isp_reason)
+    elif isp_classification == "verification":
+        return format_decision("captcha", details, isp_reason)
     
-    # 3. Browser integrity checks
+    # 3. Browser heuristics
     ua = (data.ua or "").lower()
     bot_indicators = {
         "bot", "curl", "python", "wget", "scrapy",
         "headless", "phantom", "selenium", "spider"
     }
-    
     suspicious_browser = (
         not data.jsEnabled or 
         not data.supportsCookies or
@@ -165,9 +132,8 @@ async def ai_decision(data: AICheckRequest):
         any(x in ua for x in bot_indicators) or
         data.screenRes in {"0x0", "1x1"}
     )
-    
     if suspicious_browser:
         return format_decision("captcha", details)
-    
-    # 4. Verified safe user
+
+    # 4. Safe
     return format_decision("user", details)
