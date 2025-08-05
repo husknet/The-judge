@@ -41,46 +41,31 @@ async def health():
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
     Classify ISP with strict rules and consistent responses
-    Returns (classification, clean_reason)
+    Returns (classification, full_reasoning)
     """
     if not isp or not HF_TOKEN:
         return "unsafe", "No ISP provided [unsafe]"
 
-    # Pre-check known providers
-    cloud_providers = ["azure", "aws", "google", "digitalocean", "oracle", "linode"]
-    safe_providers = ["comcast", "verizon", "rogers", "vodafone", "mtn", "airtel"]
-    
-    isp_lower = isp.lower()
-    if any(p in isp_lower for p in cloud_providers):
-        return "unsafe", f"{isp} is cloud provider [unsafe]"
-    if any(p in isp_lower for p in safe_providers):
-        return "safe", f"{isp} is residential/mobile [safe]"
-
     messages = [
         {
             "role": "system",
-            "content": """[STRICT RULES]
-RESPOND WITH:
-"<20 word reason> [tag]"
+            "content": """[STRICT CLASSIFICATION RULES]
+You are a network classification expert. Analyze the ISP and respond with:
 
-MUST USE [unsafe] FOR:
-- Cloud (AWS/Azure/Google)
-- Microsoft services
-- Security platforms
-- Scrapers/VPNs
+1. A concise 20-30 word analysis
+2. Exactly one classification tag at the end: [safe], [unsafe], or [verification]
 
-MUST USE [safe] ONLY FOR:
-- Residential ISPs
-- Mobile carriers
+RULES:
+- [safe]: ONLY for verified residential ISPs and mobile carriers
+- [unsafe]: MUST use for cloud providers, datacenters, Microsoft services, security platforms, scrapers/VPNs
+- [verification]: Only when ISP appears residential but needs human review
 
-ALL OTHERS: [unsafe]
-
-Example: "Azure cloud service [unsafe]"
+Example: "This is a Microsoft Azure cloud service [unsafe]"
 """
         },
         {
             "role": "user",
-            "content": f"Classify in 20 words max: {isp}"
+            "content": f"Classify this ISP with full reasoning: {isp}"
         }
     ]
 
@@ -89,67 +74,62 @@ Example: "Azure cloud service [unsafe]"
         response = client.chat_completion(
             messages=messages,
             model=MODEL_NAME,
-            max_tokens=30,
-            temperature=0.01,
-            stop=["\n"]
+            max_tokens=100,
+            temperature=0.1
         )
         
         full_response = response.choices[0].message.content
-        logger.info(f"ISP classification: {full_response[:50]}...")
+        logger.info(f"Full AI classification response: {full_response}")
         
-        # Strict tag extraction
-        tag_match = re.search(r"\[(safe|unsafe|verification)\]", full_response.lower())
-        if not tag_match:
-            return "unsafe", "No valid tag [unsafe]"
-            
-        tag = tag_match.group(1)
-        reason = re.sub(r"\[.*?\]", "", full_response).strip()[:100]
+        # Extract the last valid tag from response
+        tags = re.findall(r"\[(safe|unsafe|verification)\]", full_response.lower())
+        classification = tags[-1] if tags else "unsafe"
         
-        # Enforce unsafe default for any non-safe
-        if tag != "safe":
-            tag = "unsafe"
-            reason = f"{reason} [enforced unsafe]"
+        # For verification or unknown cases, default to unsafe
+        if classification == "verification":
+            classification = "unsafe"
+            full_response = f"{full_response} [enforced unsafe]"
             
-        return tag, reason
+        return classification, full_response
 
     except Exception as e:
         logger.error(f"Classification error: {str(e)}")
-        return "unsafe", "Classification failed [unsafe]"
+        return "unsafe", f"Classification failed: {str(e)} [unsafe]"
 
 def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
-    """Generate decision response with concise reasoning"""
+    """Generate complete decision response with structured reasoning"""
     base_reasons = {
         "bot": {
             "summary": "Automation detected",
             "details": isp_reason if isp_reason else (
-                "Cloud provider" if details.get('isDataCenterASN') else
-                "Bot user agent" if details.get('isBotUserAgent') else
-                "Multiple abuse flags"
+                "Cloud provider detected" if details.get('isDataCenterASN') else
+                "Bot user agent detected" if details.get('isBotUserAgent') else
+                "Multiple abuse flags triggered"
             )
         },
         "captcha": {
-            "summary": "Verification needed",
+            "summary": "Verification required",
             "details": "JS/Cookies disabled" if not details.get('jsEnabled') or not details.get('supportsCookies') else
-                      "Suspicious resolution" if details.get('screenRes') in {"0x0", "1x1"} else
-                      "Unusual browser"
+                      "Suspicious screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
+                      "Unusual browser characteristics detected"
         },
         "user": {
             "summary": "Authentic user",
-            "details": "Residential network" if "comcast" in (details.get('isp') or "").lower() else
-                      "All checks passed"
+            "details": "Residential network verified" if "comcast" in (details.get('isp') or "").lower() else
+                      "All security checks passed"
         }
     }
     
     reason = base_reasons.get(verdict, {
-        "summary": "Unknown",
-        "details": "Manual review needed"
+        "summary": "Unknown status",
+        "details": "Needs manual review"
     })
     
     return {
         "verdict": verdict,
         "reason": {
             "summary": reason['summary'],
-            "details": reason['details'],
+            "details": isp_reason if isp_reason else reason['details'],
             "decision_tag": f"[{verdict}]"
         },
         "details": {
@@ -166,20 +146,21 @@ def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
     details = data.dict()
-    logger.info(f"Request - UA: {details.get('ua','')[:50]}...")
+    logger.info(f"Request received - UA: {details.get('ua','')[:50]}...")
 
-    # 1. Immediate red flags
+    # 1. Immediate red flags check (highest priority)
     if any([data.isBotUserAgent, data.isScraperISP, 
            data.isIPAbuser, data.isSuspiciousTraffic,
            data.isDataCenterASN]):
         return format_decision("bot", details)
     
-    # 2. ISP analysis
+    # 2. ISP analysis through AI classification
     isp_classification, isp_reason = research_isp_with_llm(data.isp)
+    
     if isp_classification == "unsafe":
         return format_decision("bot", details, isp_reason)
     
-    # 3. Browser checks
+    # 3. Browser integrity checks
     ua = (data.ua or "").lower()
     bot_indicators = {
         "bot", "curl", "python", "wget", "scrapy",
@@ -197,5 +178,5 @@ async def ai_decision(data: AICheckRequest):
     if suspicious_browser:
         return format_decision("captcha", details)
     
-    # 4. Verified safe
+    # 4. Verified safe user
     return format_decision("user", details)
