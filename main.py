@@ -40,35 +40,39 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Enhanced ISP classification with validation to prevent false positives.
-    Returns (classification, reasoning)
+    Classify ISP into [safe], [unsafe], or [verification] categories.
+    Returns (classification, full_reasoning).
     """
     if not isp or not HF_TOKEN:
-        logger.warning("Missing ISP or HF_TOKEN")
-        return "", "Missing required parameters"
+        return "", "No ISP or HF_TOKEN provided"
 
     messages = [
         {
             "role": "system",
-            "content": """You are an advanced network classifier with strict rules:
+            "content": """You are an advanced network classifier with these absolute rules:
 
-1. RESIDENTIAL CLASSIFICATION ([residential]):
-   - Primary business is consumer internet/mobile services
-   - Serves home users (even if offers business/security services)
-   - Examples: Rogers, Comcast, MTN, Airtel, Verizon, Vodafone
-   - MUST classify as residential if matches these criteria
+1. SAFE NETWORKS ([safe] tag):
+   - Residential ISPs (Comcast, Rogers, MTN, Airtel)
+   - Mobile carriers (Verizon, Vodafone, T-Mobile)
+   - WiFi service providers
+   - SIM card networks
 
-2. BOT NETWORKS (only classify as these if 100% certain):
-   - [microsoft]: Microsoft-owned (Azure, LinkedIn, GitHub)
-   - [security]: Dedicated security firms (Fortinet, Zscaler)
-   - [cloud]: Cloud providers (AWS, Google Cloud)
-   - [vpn]: Commercial VPN services (NordVPN, ExpressVPN)
-   - [scraper]: Known scraping networks
+2. UNSAFE NETWORKS ([unsafe] tag):
+   - Microsoft services/subsidiaries (Azure, LinkedIn, GitHub)
+   - Security platforms (Fortinet, Proofpoint, Zscaler)
+   - Email/link scanning services
+   - Cloud providers (AWS, Google Cloud)
+   - Scrapers/proxies (BrightData, Oxylabs)
+   - Known abusive networks
 
-3. OUTPUT REQUIREMENTS:
-   - MUST include step-by-step reasoning
-   - MUST conclude with: [residential|microsoft|security|cloud|vpn|scraper|unknown]
-   - If reasoning suggests residential but conclusion differs, it will be overridden"""
+3. VERIFICATION REQUIRED ([verification] tag):
+   - Residential ISPs with suspicious activity
+   - Unknown networks not matching safe/unsafe
+   - Borderline cases needing human review
+
+Output format:
+Analysis: <step-by-step reasoning>
+Conclusion: [safe|unsafe|verification]"""
         },
         {
             "role": "user",
@@ -84,53 +88,34 @@ Provide analysis showing how each rule applies, then your conclusion tag."""
         response = client.chat_completion(
             messages=messages,
             model=MODEL_NAME,
-            max_tokens=300,
+            max_tokens=250,
             temperature=0.1,
             stop_sequences=["\n"]
         )
         
         reasoning = response.choices[0].message.content
-        logger.info(f"Initial classification for '{isp}':\n{reasoning}")
+        logger.info(f"ISP classification for '{isp}':\n{reasoning}")
 
-        # Extract classification with validation
-        conclusion_match = re.search(
-            r"Conclusion:\s*\[([a-z]+)\]", 
-            reasoning, 
-            re.IGNORECASE
+        # Extract the conclusion tag
+        tags = re.findall(
+            r"\[(safe|unsafe|verification)\]",
+            reasoning.lower()
         )
-        classification = conclusion_match.group(1).lower() if conclusion_match else "unknown"
-
-        # Critical Validation: Override if reasoning contradicts conclusion
-        residential_keywords = [
-            "residential", "consumer", "home users", 
-            "internet service", "mobile provider"
-        ]
-        if (any(kw in reasoning.lower() for kw in residential_keywords) and 
-            classification != "residential"):
-            logger.warning(f"Overriding classification to residential for {isp}")
-            classification = "residential"
-            reasoning += "\n[OVERRIDE: Corrected to residential based on analysis]"
-
+        classification = tags[-1] if tags else "verification"
+        
         return classification, reasoning
 
     except Exception as e:
         error_msg = f"Classification Error: {str(e)}"
         logger.error(error_msg)
-        return "", error_msg
-
-def is_bot_classification(classification: str) -> bool:
-    """Determine if classification indicates non-human traffic"""
-    return classification in {
-        "microsoft", "security", "cloud",
-        "vpn", "scraper"  # Removed 'partner' and 'proxy' for clarity
-    }
+        return "verification", error_msg
 
 @app.post("/ai-decision")
 async def ai_decision(data: AICheckRequest):
-    request_details = data.dict()
-    logger.info(f"New request: {request_details}")
+    details = data.dict()
+    logger.info(f"Request received: {details}")
 
-    # 1. Immediate Cloudflare bot flags
+    # 1. Cloudflare flags - immediate unsafe detection
     cloudflare_flags = {
         "isBotUserAgent": data.isBotUserAgent,
         "isScraperISP": data.isScraperISP,
@@ -139,83 +124,53 @@ async def ai_decision(data: AICheckRequest):
         "isDataCenterASN": data.isDataCenterASN
     }
     
-    if any(cloudflare_flags.values()):
-        logger.warning(f"Bot detected via Cloudflare flags: {cloudflare_flags}")
+    # 2. ISP analysis
+    isp_classification = "safe"  # Default to safe if no ISP provided
+    reasoning = "No ISP provided"
+    
+    if data.isp:
+        isp_classification, reasoning = research_isp_with_llm(data.isp)
+    
+    # Determine final verdict based on all factors
+    if (any(cloudflare_flags.values()) or 
+        isp_classification == "unsafe"):
         return {
             "verdict": "bot",
-            "reason": "Cloudflare security flags triggered",
-            "details": request_details
+            "reason": "Unsafe network detected",
+            "details": details,
+            "ai_reasoning": reasoning
         }
-
-    # 2. Comprehensive ISP analysis
-    if data.isp:
-        classification, reasoning = research_isp_with_llm(data.isp)
-        
-        if not classification:
-            logger.error(f"Failed to classify ISP: {data.isp}")
-            return {
-                "verdict": "uncertain",
-                "reason": "ISP classification service unavailable",
-                "details": request_details,
-                "ai_reasoning": reasoning
-            }
-            
-        if is_bot_classification(classification):
-            logger.info(f"Bot network detected: {classification} for {data.isp}")
-            return {
-                "verdict": "bot",
-                "reason": f"Classified as {classification} network",
-                "details": request_details,
-                "ai_reasoning": reasoning
-            }
-
-    # 3. Browser fingerprint checks
+    elif (isp_classification == "verification" or
+          len(data.ua or "") < 20 or
+          data.screenRes in {"0x0", "1x1"} or
+          data.lang not in {"en-US", "en-CA", "en", "fr", "es", "de", "fr-CA", "ja-JP"}):
+        return {
+            "verdict": "captcha",
+            "reason": "Verification required",
+            "details": details,
+            "ai_reasoning": reasoning
+        }
+    
+    # 3. Browser checks
     ua = (data.ua or "").lower()
     bot_indicators = {
         "bot", "curl", "python", "wget", "scrapy",
         "headless", "phantom", "selenium", "spider",
-        "zgrab", "nmap", "masscan", "automated"
+        "zgrab", "nmap", "masscan"
     }
     
-    browser_checks = {
-        "no_js": not data.jsEnabled,
-        "no_cookies": not data.supportsCookies,
-        "bot_ua": any(ind in ua for ind in bot_indicators),
-        "short_ua": len(data.ua or "") < 20
-    }
-    
-    if any(browser_checks.values()):
-        logger.warning(f"Bot detected via browser checks: {browser_checks}")
+    if (not data.jsEnabled or 
+        not data.supportsCookies or 
+        any(ind in ua for ind in bot_indicators)):
         return {
             "verdict": "bot",
-            "reason": "Automation characteristics detected",
-            "details": request_details
+            "reason": "Automation detected",
+            "details": details
         }
 
-    # 4. Suspicious attributes
-    valid_languages = {
-        "en-US", "en-CA", "en-GB", "en", 
-        "fr", "es", "de", "fr-CA", "ja-JP"
-    }
-    
-    suspicious_attributes = {
-        "invalid_resolution": data.screenRes in {"0x0", "1x1"},
-        "unusual_language": data.lang not in valid_languages,
-        "missing_timezone": not data.timezone
-    }
-    
-    if any(suspicious_attributes.values()):
-        logger.info(f"Suspicious attributes: {suspicious_attributes}")
-        return {
-            "verdict": "uncertain",
-            "reason": "Suspicious client characteristics",
-            "details": request_details
-        }
-
-    # 5. Verified human traffic
-    logger.info("Request passed all verification checks")
+    # 4. Verified safe user
     return {
-        "verdict": "human",
+        "verdict": "user",
         "reason": "All checks passed",
-        "details": request_details
+        "details": details
     }
