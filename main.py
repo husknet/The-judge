@@ -58,7 +58,7 @@ You are a network classification expert. Analyze the ISP and respond with:
 RULES:
 - [safe]: ONLY for verified residential ISPs and mobile carriers
 - [unsafe]: MUST use for cloud providers, datacenters, Microsoft services, security platforms, scrapers/VPNs
-- [verification]: Only when ISP appears residential but needs human review
+- [verification]: Use when ISP needs human review (unknown residential, borderline cases)
 
 Example: "This is a Microsoft Azure cloud service [unsafe]"
 """
@@ -188,3 +188,4 @@ async def ai_decision(data: AICheckRequest):
     
     # 4. Verified safe user
     return format_decision("user", details)
+
