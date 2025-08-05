@@ -6,12 +6,14 @@ import re
 import logging
 from huggingface_hub import InferenceClient
 
-# Configure logging
+# Configure logging with increased max message length
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+# Increase max log message length (adjust as needed)
+logger.handlers[0].setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message).1000s'))
 
 app = FastAPI()
 
@@ -52,7 +54,7 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
             "content": """[STRICT CLASSIFICATION RULES]
 You are a network classification expert. Analyze the ISP and respond with:
 
-1. A concise 20-30 word analysis
+1. A concise analysis (1-2 sentences)
 2. Exactly one classification tag at the end: [safe], [unsafe], or [verification]
 
 RULES:
@@ -74,12 +76,19 @@ Example: "This is a Microsoft Azure cloud service [unsafe]"
         response = client.chat_completion(
             messages=messages,
             model=MODEL_NAME,
-            max_tokens=100,
+            max_tokens=300,  # Increased to allow full response
             temperature=0.1
         )
         
         full_response = response.choices[0].message.content
-        logger.info(f"Full AI classification response: {full_response}")
+        
+        # Log the complete response in chunks if needed
+        max_log_length = 1000  # Adjust based on your logging system
+        if len(full_response) > max_log_length:
+            for i in range(0, len(full_response), max_log_length):
+                logger.info(f"AI Response Part {i//max_log_length + 1}: {full_response[i:i+max_log_length]}")
+        else:
+            logger.info(f"Full AI classification response: {full_response}")
         
         # Extract the last valid tag from response
         tags = re.findall(r"\[(safe|unsafe|verification)\]", full_response.lower())
@@ -93,8 +102,9 @@ Example: "This is a Microsoft Azure cloud service [unsafe]"
         return classification, full_response
 
     except Exception as e:
-        logger.error(f"Classification error: {str(e)}")
-        return "unsafe", f"Classification failed: {str(e)} [unsafe]"
+        error_msg = f"Classification error: {str(e)}"
+        logger.error(error_msg)
+        return "unsafe", f"{error_msg} [unsafe]"
 
 def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
     """Generate complete decision response with structured reasoning"""
