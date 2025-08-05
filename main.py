@@ -42,11 +42,11 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
     Classify ISP into [safe], [unsafe], or [verification] categories.
     Returns (classification, full_reasoning).
+    If tag is [unknown], treat as [unsafe].
     """
     if not isp or not HF_TOKEN:
         return "safe", "No ISP provided - default safe [safe]"
 
-    # ONLY THE MESSAGES SECTION CHANGED BELOW:
     messages = [
         {
             "role": "system",
@@ -55,8 +55,9 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
                 "Rules:\n"
                 "- [safe]: Major residential ISPs and regular mobile providers.\n"
                 "- [unsafe]: Anything cloud, security, scraping, VPN/proxy, Microsoft, or known bot infra.\n"
-                "- [verification]: Only use if there is no clear evidence either way.\n\n"
-                "Give a 1-2 sentence reasoning. END with one tag: [safe], [unsafe], or [verification]."
+                "- [unknown]: Use if ISP is not found in public records or you are unsure or rather isp is unknown.\n"
+                "- [verification]: Only use if the isp is a Major residential ISP but the provided flags still suggest it might be inaccurate.\n\n"
+                "Give a 1-2 sentence reasoning. END with one tag: [safe], [unsafe], [unknown], or [verification]."
             )
         },
         {
@@ -78,10 +79,15 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
         logger.info(f"ISP classification response: {reasoning}")
 
         # Extract decision tag and clean reasoning
-        tags = re.findall(r"\[(safe|unsafe|verification)\]", reasoning.lower())
+        tags = re.findall(r"\[(safe|unsafe|unknown|verification)\]", reasoning.lower())
         classification = tags[-1] if tags else "safe"
         clean_reason = re.sub(r"\[.*?\]", "", reasoning).strip()
         
+        # If the tag is [unknown], treat as [unsafe]
+        if classification == "unknown":
+            classification = "unsafe"
+            clean_reason = f"{clean_reason} [tag changed from unknown to unsafe]"
+
         return classification, clean_reason
 
     except Exception as e:
