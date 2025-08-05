@@ -44,7 +44,7 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
     Returns (classification, full_reasoning)
     """
     if not isp or not HF_TOKEN:
-        return "unsafe", "No ISP provided [unsafe]"
+        return "verification", "No ISP provided [verification]"
 
     messages = [
         {
@@ -90,19 +90,14 @@ Example: "This is a Microsoft Azure cloud service [unsafe]"
         
         # Extract the last valid tag from response
         tags = re.findall(r"\[(safe|unsafe|verification)\]", full_response.lower())
-        classification = tags[-1] if tags else "unsafe"
-        
-        # For verification or unknown cases, default to unsafe
-        if classification == "verification":
-            classification = "unsafe"
-            full_response = f"{full_response} [enforced unsafe]"
+        classification = tags[-1] if tags else "verification"
             
         return classification, full_response
 
     except Exception as e:
         error_msg = f"Classification error: {str(e)}"
         logger.error(error_msg)
-        return "unsafe", f"{error_msg} [unsafe]"
+        return "verification", f"{error_msg} [verification]"
 
 def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
     """Generate complete decision response with structured reasoning"""
@@ -117,9 +112,11 @@ def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
         },
         "captcha": {
             "summary": "Verification required",
-            "details": "JS/Cookies disabled" if not details.get('jsEnabled') or not details.get('supportsCookies') else
-                      "Suspicious screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
-                      "Unusual browser characteristics detected"
+            "details": isp_reason if isp_reason and verdict == "captcha" else (
+                "JS/Cookies disabled" if not details.get('jsEnabled') or not details.get('supportsCookies') else
+                "Suspicious screen resolution" if details.get('screenRes') in {"0x0", "1x1"} else
+                "Unusual browser characteristics detected"
+            )
         },
         "user": {
             "summary": "Authentic user",
@@ -137,7 +134,7 @@ def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
         "verdict": verdict,
         "reason": {
             "summary": reason['summary'],
-            "details": isp_reason if isp_reason else reason['details'],
+            "details": isp_reason if isp_reason and verdict != "captcha" else reason['details'],
             "decision_tag": f"[{verdict}]"
         },
         "details": {
@@ -167,6 +164,8 @@ async def ai_decision(data: AICheckRequest):
     
     if isp_classification == "unsafe":
         return format_decision("bot", details, isp_reason)
+    elif isp_classification == "verification":
+        return format_decision("captcha", details, isp_reason)
     
     # 3. Browser integrity checks
     ua = (data.ua or "").lower()
@@ -188,4 +187,3 @@ async def ai_decision(data: AICheckRequest):
     
     # 4. Verified safe user
     return format_decision("user", details)
-
