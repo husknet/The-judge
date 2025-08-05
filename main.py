@@ -89,8 +89,8 @@ Provide analysis showing how each rule applies, then your conclusion tag."""
             messages=messages,
             model=MODEL_NAME,
             max_tokens=250,
-            temperature=0.1,
-            stop_sequences=["\n"]
+            temperature=0.1
+            # Removed stop_sequences as it's not supported
         )
         
         reasoning = response.choices[0].message.content
@@ -99,9 +99,10 @@ Provide analysis showing how each rule applies, then your conclusion tag."""
         # Extract the conclusion tag
         tags = re.findall(
             r"\[(safe|unsafe|verification)\]",
-            reasoning.lower()
+            reasoning,
+            re.IGNORECASE
         )
-        classification = tags[-1] if tags else "verification"
+        classification = tags[-1].lower() if tags else "verification"
         
         return classification, reasoning
 
