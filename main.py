@@ -40,18 +40,17 @@ async def health():
 
 def research_isp_with_llm(isp: str) -> tuple[str, str]:
     """
-    Returns: (classification, full_response)
-    If response is missing/malformed, always defaults to 'unsafe'.
+    Returns: (classification, reason)
+    Defaults to 'unsafe' if response is missing/malformed.
     """
     if not isp or not HF_TOKEN:
         return "unsafe", "No ISP or HF_TOKEN provided"
 
-    # Stricter prompt: single line, must end with one of the tags, very short.
     prompt = (
         "You are a strict ISP risk classifier.\n"
         "Rules:\n"
         "- [safe]: ONLY for well-known RESIDENTIAL ISPs and mobile carriers. Examples: Comcast, Rogers, Verizon, MTN, Airtel.\n"
-        "- [unsafe]: MUST USE for ANYTHING cloud, Microsoft,microsoft related services eg azure. any known proxy, VPN, scraper, business, datacenter, security, unknown, or if not 100% residential.\n"
+        "- [unsafe]: MUST USE for ANYTHING cloud, Microsoft, microsoft related services eg azure, any known proxy, VPN, scraper, business, datacenter, security, unknown, or if not 100% residential.\n"
         "- [verification]: Use ONLY if major residential, but browser/device flags suggest bot.\n"
         "Respond with a single short line: One phrase and EXACT tag at end. No extra text. Format:\n"
         "'REASON [safe|unsafe|verification]'\n"
@@ -70,13 +69,11 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
                 {"role": "user", "content": f"Classify this ISP: {isp}"}
             ],
             model=MODEL_NAME,
-            max_tokens=20,   # Force brevity
-            temperature=0.01,
-            stop_sequences=["\n"]  # Enforce single line (if supported)
+            max_tokens=20,
+            temperature=0.01
         )
 
         response_text = response.choices[0].message.content.strip()
-        # Extract exact tag: must match end of line, surrounded by brackets
         match = re.match(r"^(.*)\[(safe|unsafe|verification)\]$", response_text)
         if match:
             tag = match.group(2)
@@ -91,7 +88,7 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
         return "unsafe", f"Classification Error: {str(e)}"
 
 def format_decision(verdict: str, details: dict, isp_reason: str = "") -> dict:
-    """Generate decision with only debug reason if needed."""
+    """Generate decision response. Only debug reason if needed."""
     return {
         "verdict": verdict if verdict in {"bot", "captcha", "user"} else "bot",
         "reason": {
