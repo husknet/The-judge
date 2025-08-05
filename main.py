@@ -46,32 +46,22 @@ def research_isp_with_llm(isp: str) -> tuple[str, str]:
     if not isp or not HF_TOKEN:
         return "safe", "No ISP provided - default safe [safe]"
 
+    # ONLY THE MESSAGES SECTION CHANGED BELOW:
     messages = [
         {
             "role": "system",
-            "content": """[SYSTEM RULES]
-1. SAFE NETWORKS ([safe] tag):
-   - Residential ISPs (Comcast, Rogers, Eastlink, MTN, Airtel)
-   - Mobile carriers (Verizon, Vodafone, T-Mobile)
-   - WiFi/SIM card networks
-
-2. UNSAFE NETWORKS ([unsafe] tag):
-   - Cloud providers (AWS, Azure, Google Cloud)
-   - Scrapers/proxies (BrightData, Oxylabs)
-   - Security platforms (Fortinet, Zscaler)
-
-3. VERIFICATION REQUIRED ([verification] tag):
-   - Only if clearly suspicious but unclassified
-
-FORMAT REQUIREMENTS:
-1. Provide 50-word max reasoning
-2. End with exactly: [decision_tag]
-Example: "This residential ISP matches known safe networks [safe]"
-"""
+            "content": (
+                "You are a professional network risk classifier.\n"
+                "Rules:\n"
+                "- [safe]: Major residential ISPs and regular mobile providers.\n"
+                "- [unsafe]: Anything cloud, security, scraping, VPN/proxy, Microsoft, or known bot infra.\n"
+                "- [verification]: Only use if there is no clear evidence either way.\n\n"
+                "Give a 1-2 sentence reasoning. END with one tag: [safe], [unsafe], or [verification]."
+            )
         },
         {
             "role": "user",
-            "content": f"Classify this ISP concisely: {isp}"
+            "content": f"Classify this ISP and explain why: {isp}"
         }
     ]
 
