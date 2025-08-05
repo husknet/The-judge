@@ -33,6 +33,7 @@ class AICheckRequest(BaseModel):
     isIPAbuser: Optional[bool] = False
     isSuspiciousTraffic: Optional[bool] = False
     isDataCenterASN: Optional[bool] = False
+    honeypotVisited: Optional[bool] = False  # <--- Added this line
 
 @app.get("/")
 async def health():
@@ -155,7 +156,11 @@ async def ai_decision(data: AICheckRequest):
     details = data.dict()
     logger.info(f"Request received - UA: {details.get('ua','')[:50]}...")
 
-    # 1. Immediate red flags check (highest priority)
+    # 0. Honeypot visited check (absolute priority)
+    if getattr(data, "honeypotVisited", False):
+        return format_decision("bot", details, "Honeypot triggered by client")
+
+    # 1. Immediate red flags check (highest priority after honeypot)
     if any([data.isBotUserAgent, data.isScraperISP, 
            data.isIPAbuser, data.isSuspiciousTraffic,
            data.isDataCenterASN]):
