@@ -58,7 +58,7 @@ You are a network classification expert. Analyze the ISP and respond with:
 
 RULES:
 - [safe]: Use ONLY for major, well-known residential ISPs and mobile carriers (e.g., Comcast, BT, Eastlink, Rogers, AT&T, Telstra, Orange, T-Mobile, etc). If you are confident the ISP is primarily residential, use [safe]. Do NOT use [verification] for these.
-- [unsafe]: Use for any ISP clearly identified as a cloud provider, datacenter, Microsoft, security/VPN/scraper, or not residential.
+- [unsafe]: Use for any ISP clearly identified as a cloud provider, datacenter, Microsoft,spacex services inc, security/VPN/scraper, or not residential.
 - [verification]: Use ONLY if there is NO info about the ISP or if it's impossible to determine its type after a good-faith search. Never use [verification] for well-known residential ISPs.
 
 NEVER use multiple tags. Always commit to a single, best tag.
@@ -194,3 +194,4 @@ async def ai_decision(data: AICheckRequest):
     
     # 4. Verified safe user
     return format_decision("user", details)
+
